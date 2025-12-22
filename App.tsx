@@ -25,6 +25,15 @@ import { Frame, ChromaSettings, SheetSettings } from './types';
 
 // --- Utility Functions ---
 
+// 自定义UUID生成函数，兼容HTTP环境
+const generateUUID = (): string => {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.floor(Math.random() * 16);
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
 const hexToRgb = (hex: string): [number, number, number] => {
   const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
   return result
@@ -111,6 +120,7 @@ export default function App() {
       setGeneratedSheetUrl(null);
       setProgress(0);
       setCurrentFrameDim(null);
+      console.log('Video file selected:', file.name, 'Size:', file.size, 'Type:', file.type);
     }
   };
 
@@ -118,6 +128,7 @@ export default function App() {
     if (videoRef.current) {
       setDuration(videoRef.current.duration);
       setEndTime(videoRef.current.duration);
+      console.log('Video metadata loaded:', videoRef.current.duration, 'seconds,', videoRef.current.videoWidth, 'x', videoRef.current.videoHeight);
     }
   };
 
@@ -131,17 +142,64 @@ export default function App() {
     }
   };
 
+  const handleVideoError = (e: React.SyntheticEvent<HTMLVideoElement, Event>) => {
+    const videoElement = e.target as HTMLVideoElement;
+    const errorEvent = e.nativeEvent as ErrorEvent;
+    const mediaError = videoElement.error;
+    
+    console.error('Video error occurred:', {
+      eventType: e.type,
+      errorCode: mediaError?.code,
+      errorMessage: mediaError?.message,
+      src: videoElement.src,
+      readyState: videoElement.readyState,
+      networkState: videoElement.networkState
+    });
+    
+    setIsExtracting(false);
+    
+    // 只对严重的播放错误显示alert，忽略加载过程中的临时错误
+    if (e.type === 'error' && mediaError?.code) {
+      // 错误代码说明：
+      // 1 = MEDIA_ERR_ABORTED - 用户中止了加载
+      // 2 = MEDIA_ERR_NETWORK - 网络错误
+      // 3 = MEDIA_ERR_DECODE - 解码错误
+      // 4 = MEDIA_ERR_SRC_NOT_SUPPORTED - 格式不支持
+      if (mediaError.code === 4) {
+        alert('视频格式不受支持，请尝试MP4或WebM格式。');
+      } else if (mediaError.code === 3) {
+        alert('视频解码失败，请尝试其他视频文件。');
+      } else if (mediaError.code === 2) {
+        alert('网络错误，视频加载失败。');
+      }
+      // 不显示MEDIA_ERR_ABORTED错误，因为这可能是正常的用户操作
+    }
+  };
+
   const togglePlay = () => {
     if (videoRef.current) {
       if (isPlaying) videoRef.current.pause();
-      else videoRef.current.play();
+      else videoRef.current.play().catch(err => {
+        console.error('Video play error:', err);
+        setIsPlaying(false);
+      });
       setIsPlaying(!isPlaying);
     }
   };
 
   // --- Frame Extraction Logic ---
   const extractFrames = async () => {
-    if (!videoRef.current || !canvasRef.current) return;
+    console.log('=== extractFrames function started ===');
+    
+    if (!videoRef.current || !canvasRef.current) {
+      console.error('Video or canvas reference not available');
+      return;
+    }
+    
+    if (!videoFile) {
+      console.error('No video file selected');
+      return;
+    }
     
     setIsExtracting(true);
     setProgress(0);
@@ -152,66 +210,217 @@ export default function App() {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     
-    if (!ctx) return;
+    if (!ctx) {
+      console.error('Canvas context not available');
+      setIsExtracting(false);
+      return;
+    }
+    
+    // Check if video has valid duration
+    if (vid.duration <= 0) {
+      console.error('Video has invalid duration');
+      setIsExtracting(false);
+      alert('视频加载失败，请重试。');
+      return;
+    }
+    
+    // Ensure start time is less than end time
+    if (startTime >= endTime) {
+      console.error('Invalid time range: start time must be less than end time');
+      setIsExtracting(false);
+      alert('请设置有效的时间范围。');
+      return;
+    }
+
+    // 详细记录用户预设参数
+    console.log('Video and canvas ready, starting extraction process');
+    console.log('User preset parameters:', {
+      startTime: startTime.toFixed(2) + 's',
+      endTime: endTime.toFixed(2) + 's',
+      duration: (endTime - startTime).toFixed(2) + 's',
+      fps: fps,
+      expectedFrames: Math.floor((endTime - startTime) * fps),
+      videoWidth: vid.videoWidth,
+      videoHeight: vid.videoHeight
+    });
 
     // Pause video to control seeking manually
     vid.pause();
     setIsPlaying(false);
 
     const extracted: Frame[] = [];
-    const interval = 1 / fps;
+    const interval = 1 / fps; // 根据FPS计算帧间隔
     let cursor = startTime;
     const totalDuration = Math.max(0.1, endTime - startTime); // 防止除以0
 
     canvas.width = vid.videoWidth;
     canvas.height = vid.videoHeight;
 
-    try {
-      while (cursor <= endTime) {
-        // Seek
-        vid.currentTime = cursor;
-        
-        // Wait for seek to complete
-        await new Promise<void>((resolve) => {
-          const onSeek = () => {
-            vid.removeEventListener('seeked', onSeek);
-            resolve();
-          };
-          vid.addEventListener('seeked', onSeek, { once: true });
-        });
+    console.log('Canvas size set to:', vid.videoWidth, 'x', vid.videoHeight);
+    console.log('Frame extraction interval:', interval.toFixed(3) + 's');
 
-        // Draw
-        ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    try {
+      let frameCount = 0;
+      while (cursor <= endTime) {
+        console.log(`Frame ${frameCount + 1}: Seeking to time`, cursor.toFixed(3), 's (target)');
         
-        extracted.push({
-          id: crypto.randomUUID(),
-          timestamp: cursor,
-          originalDataUrl: canvas.toDataURL('image/png'),
-          selected: true
-        });
+        // 检查视频是否仍然可以播放
+        if (vid.paused && !vid.ended && vid.readyState < 2) {
+          console.error('Video is in invalid state for extraction:', { 
+            paused: vid.paused, 
+            ended: vid.ended, 
+            readyState: vid.readyState 
+          });
+          throw new Error('Video playback error during extraction');
+        }
+        
+        // Seek to target time
+        try {
+          vid.currentTime = cursor;
+        } catch (seekSetErr) {
+          console.error('Failed to set currentTime:', seekSetErr);
+          throw new Error(`Failed to seek to ${cursor.toFixed(3)}s: ${seekSetErr instanceof Error ? seekSetErr.message : 'Unknown error'}`);
+        }
+        
+        // Wait for seek to complete with timeout
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              console.error('Seek timed out after 5 seconds at time:', cursor);
+              reject(new Error('Seek timed out'));
+            }, 5000);
+            
+            const onSeek = () => {
+              clearTimeout(timeout);
+              vid.removeEventListener('seeked', onSeek);
+              console.log('Seek completed to time:', vid.currentTime.toFixed(3), 's (actual)');
+              resolve();
+            };
+            
+            // 检查是否已经处于目标时间附近
+            if (Math.abs(vid.currentTime - cursor) < 0.01) {
+              console.log('Already at target time, skipping seek');
+              clearTimeout(timeout);
+              resolve();
+            } else {
+              vid.addEventListener('seeked', onSeek, { once: true });
+            }
+          });
+        } catch (seekErr) {
+          console.error('Seek error:', seekErr);
+          // 检查视频是否真的在正确位置
+          if (Math.abs(vid.currentTime - cursor) > 0.05) {
+            console.error('Video not at expected position, skipping frame');
+            cursor += interval;
+            continue;
+          }
+        }
+
+        // Draw frame
+        console.log('Drawing frame at time:', cursor.toFixed(3), 's');
+        try {
+          ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+        } catch (drawErr) {
+          console.error('Failed to draw frame to canvas:', drawErr);
+          throw new Error(`Failed to draw frame at ${cursor.toFixed(3)}s: ${drawErr instanceof Error ? drawErr.message : 'Unknown error'}`);
+        }
+        
+        // 提取帧
+        try {
+          const dataUrl = canvas.toDataURL('image/png');
+          extracted.push({
+            id: generateUUID(),
+            timestamp: cursor,
+            originalDataUrl: dataUrl,
+            selected: true
+          });
+        } catch (dataUrlErr) {
+          console.error('Failed to create data URL:', dataUrlErr);
+          throw new Error(`Failed to extract frame data at ${cursor.toFixed(3)}s: ${dataUrlErr instanceof Error ? dataUrlErr.message : 'Unknown error'}`);
+        }
 
         // 更新进度
-        const percent = Math.min(100, Math.round(((cursor - startTime) / totalDuration) * 100));
-        setProgress(percent);
+        const progressValue = Math.min(100, Math.round(((cursor - startTime) / totalDuration) * 100));
+        setProgress(progressValue);
 
+        // 移动到下一个帧位置
         cursor += interval;
+        frameCount++;
+        console.log('Frame extracted successfully, progress:', progressValue + '%');
+        
         // Safety break for extremely long videos
         if (extracted.length > 200) {
+            console.log('Reached frame limit (200 frames)');
             alert("已达上限：为防止内存溢出，本演示仅提取前 200 帧。");
             break;
         }
+        
+        // 添加小延迟防止浏览器卡死
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
+      
+      console.log('Extraction loop completed');
+      
+      // 验证提取结果与预设参数的一致性
+      const expectedFramesCount = Math.min(200, Math.floor((endTime - startTime) * fps));
+      const actualFps = extracted.length / (endTime - startTime);
+      const fpsAccuracy = Math.abs(actualFps - fps) / fps * 100;
+      
+      console.log('=== Extraction Result Verification ===');
+      console.log('User preset parameters:');
+      console.log('  - Time range:', startTime.toFixed(2) + 's to', endTime.toFixed(2) + 's (' + (endTime - startTime).toFixed(2) + 's)');
+      console.log('  - Target FPS:', fps);
+      console.log('  - Expected frames:', expectedFramesCount);
+      console.log('Extraction results:');
+      console.log('  - Actual frames extracted:', extracted.length);
+      console.log('  - Actual FPS:', actualFps.toFixed(2));
+      console.log('  - FPS accuracy:', (100 - fpsAccuracy).toFixed(1) + '%');
+      console.log('  - Time coverage:', Math.min(100, ((cursor - startTime) / totalDuration) * 100).toFixed(1) + '% of target range');
+      
+      // 检查结果是否符合预期
+      if (Math.abs(extracted.length - expectedFramesCount) <= 1) {
+        console.log('✅ Frame count matches expected value');
+      } else {
+        console.log('⚠️  Frame count differs from expected (actual:', extracted.length, ', expected:', expectedFramesCount, ')');
+      }
+      
+      if (fpsAccuracy <= 10) {
+        console.log('✅ FPS accuracy is within acceptable range (<= 10% error)');
+      } else {
+        console.log('⚠️  FPS accuracy may be lower than expected (error:', fpsAccuracy.toFixed(1), '%)');
+      }
+      
     } catch (err) {
-      console.error("Extraction error", err);
+      console.error("Extraction error", {
+        error: err,
+        details: {
+          frameCount: extracted.length,
+          currentTime: cursor,
+          videoState: {
+            readyState: vid.readyState,
+            networkState: vid.networkState,
+            paused: vid.paused,
+            ended: vid.ended
+          }
+        }
+      });
+      alert(`提取帧时发生错误：${err instanceof Error ? err.message : '未知错误'}\n请检查控制台日志获取详细信息。`);
     }
 
     setFrames(extracted);
     setPreviewFrameIndex(0);
     setProgress(100);
-    setTimeout(() => setIsExtracting(false), 500); // 稍微延迟以显示完成状态
+    console.log('Setting extraction complete, frames set:', extracted.length);
+    
+    setTimeout(() => {
+      setIsExtracting(false);
+      console.log('isExtracting set to false');
+    }, 500); // 稍微延迟以显示完成状态
     
     // Reset video
     vid.currentTime = startTime;
+    console.log('Video reset to start time:', startTime);
+    console.log('=== extractFrames function completed ===');
   };
 
   // --- Chroma Key Logic ---
@@ -279,8 +488,11 @@ export default function App() {
 
   // --- Sprite Sheet Generation ---
   const generateSpriteSheet = async () => {
+    console.log('=== generateSpriteSheet function started ===');
+    
     if (frames.length === 0 || !sheetCanvasRef.current) {
         console.error("无法生成：帧为空或Canvas未挂载");
+        alert("无法生成精灵图：帧为空或Canvas未正确挂载。");
         return;
     }
     
@@ -289,21 +501,35 @@ export default function App() {
 
     const selectedFrames = frames.filter(f => f.selected);
     if (selectedFrames.length === 0) {
+      console.error("未选择任何帧");
       alert("未选择任何帧！");
       setIsGenerating(false);
       return;
     }
 
+    console.log('Generating sprite sheet with', selectedFrames.length, 'frames');
+
     const canvas = sheetCanvasRef.current;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return;
+    if (!ctx) {
+      console.error("无法获取Canvas上下文");
+      alert("无法生成精灵图：Canvas上下文获取失败。");
+      setIsGenerating(false);
+      return;
+    }
 
     // Load first frame to get dimensions
     const loadImg = (src: string): Promise<HTMLImageElement> => {
         return new Promise((resolve, reject) => {
             const img = new Image();
-            img.onload = () => resolve(img);
-            img.onerror = reject;
+            img.onload = () => {
+                console.log('Image loaded successfully');
+                resolve(img);
+            };
+            img.onerror = (error) => {
+                console.error('Image loading error:', error);
+                reject(new Error('Image loading failed'));
+            };
             img.src = src;
         });
     };
@@ -313,6 +539,8 @@ export default function App() {
         const originalW = firstImg.width;
         const originalH = firstImg.height;
         
+        console.log('First frame dimensions:', originalW, 'x', originalH);
+        
         // 计算目标宽高
         let targetW: number;
         let targetH: number;
@@ -320,16 +548,22 @@ export default function App() {
         if (sheetSettings.outputMode === 'fixed') {
             targetW = sheetSettings.customWidth;
             targetH = sheetSettings.customHeight;
+            console.log('Using fixed size:', targetW, 'x', targetH);
         } else {
             targetW = Math.round(originalW * sheetSettings.scale);
             targetH = Math.round(originalH * sheetSettings.scale);
+            console.log('Using scaled size:', targetW, 'x', targetH, 'Scale:', sheetSettings.scale);
         }
 
         const cols = sheetSettings.columns;
         const rows = Math.ceil(selectedFrames.length / cols);
 
+        console.log('Sheet layout:', cols, 'columns,', rows, 'rows');
+
         canvas.width = (cols * targetW) + ((cols - 1) * sheetSettings.padding);
         canvas.height = (rows * targetH) + ((rows - 1) * sheetSettings.padding);
+
+        console.log('Sheet canvas size:', canvas.width, 'x', canvas.height);
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -339,7 +573,9 @@ export default function App() {
         offCanvas.height = originalH;
         const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
 
-        if (!offCtx) throw new Error("Could not create offscreen context");
+        if (!offCtx) {
+            throw new Error("Could not create offscreen context");
+        }
 
         for (let i = 0; i < selectedFrames.length; i++) {
             const frame = selectedFrames[i];
@@ -349,6 +585,7 @@ export default function App() {
             const x = col * (targetW + sheetSettings.padding);
             const y = row * (targetH + sheetSettings.padding);
 
+            console.log(`Processing frame ${i + 1}/${selectedFrames.length}`);
             const img = await loadImg(frame.originalDataUrl);
             
             // Process chroma key
@@ -361,13 +598,17 @@ export default function App() {
         const dataUrl = canvas.toDataURL('image/png');
         setGeneratedSheetUrl(dataUrl);
         setShowSheetPreview(true);
+        console.log('Sprite sheet generated successfully');
         
     } catch (e) {
         console.error("Error generating sheet", e);
-        alert("生成精灵图失败。");
+        alert("生成精灵图失败：" + (e instanceof Error ? e.message : String(e)));
     } finally {
         setIsGenerating(false);
+        console.log('isGenerating set to false');
     }
+    
+    console.log('=== generateSpriteSheet function completed ===');
   };
 
   const handleDownload = () => {
@@ -486,6 +727,8 @@ export default function App() {
                   onLoadedMetadata={handleLoadedMetadata}
                   onTimeUpdate={handleTimeUpdate}
                   onEnded={() => setIsPlaying(false)}
+                  onError={handleVideoError}
+                  // 只保留onError事件，其他状态事件不需要触发错误处理
                  />
                  <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button 
@@ -636,8 +879,6 @@ export default function App() {
                   </button>
                 </div>
               </div>
-
-              <canvas ref={canvasRef} className="hidden" />
             </div>
           </section>
         )}
@@ -936,10 +1177,12 @@ export default function App() {
             </div>
         )}
 
-        {/* 关键修复：将用于生成的Canvas始终保留在DOM中（隐藏），确保ref始终有效 */}
-        <canvas ref={sheetCanvasRef} className="hidden" />
+  </main>
 
-      </main>
+      {/* 关键修复：将所有Canvas元素始终保留在DOM中（隐藏），确保ref始终有效 */}
+      <canvas ref={sheetCanvasRef} className="hidden" />
+      <canvas ref={canvasRef} className="hidden" />
+
     </div>
   );
 }
